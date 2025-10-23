@@ -818,16 +818,18 @@ export default function App() {
   const { canvasRef, containerRef, rendererRef } = useRendererViewport()
 
   // -------- Resolve matrix exactly once per K or when genMatrix flag is true.
+  // Replace your “Resolve matrix…” effect with this:
   useEffect(() => {
-    if (!spec.genMatrix) return
+    const need =
+      spec.genMatrix ||
+      spec.A.length !== spec.K ||
+      spec.A.some((r) => r.length !== spec.K)
+
+    if (!need) return
+
     const fromLS = loadMatrixFromLS(spec.K)
-    const nextA =
-      fromLS ??
-      (spec.A &&
-      spec.A.length === spec.K &&
-      spec.A.every((r) => Array.isArray(r) && r.length === spec.K)
-        ? spec.A
-        : genRingPreset(spec.K))
+    const nextA = fromLS ?? genRingPreset(spec.K)
+
     setSpec((s) => ({ ...s, A: nextA, genMatrix: false }))
   }, [spec.K, spec.genMatrix])
 
@@ -906,8 +908,9 @@ export default function App() {
   const incK = (delta: number) => {
     const maxK = TYPE_COLORS.length
     const newK = clamp(spec.K + delta, 2, maxK)
-    setSpec((s) => ({ ...s, K: newK })) // force A regeneration on K change
+    setSpec((s) => ({ ...s, K: newK, genMatrix: true }))
   }
+
   const applyRingPreset = () =>
     applyMatrix(genRingPreset(spec.K, 0.9, 0.6, 0.0))
 
