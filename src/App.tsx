@@ -7,10 +7,23 @@ import React, { useEffect, useRef, useState } from "react"
  * - Second-order dynamics with drag and vMax clamp.
  * - Uniform-grid neighbor search.
  * - Toolbar shows a K×K clickable grid to edit A.
- *   * Left-click cycles value: -1 → -0.5 → 0 → +0.5 → +1 → …
+ *   * Left-click cycles value: -1 → 0 → +1 → …
  *   * Right-click cycles the other direction.
  *   * Values are saved to localStorage and applied live.
  * - “Ring preset”: each type attracts itself and its next color (i→i, i→i+1).
+ *
+ * Rendering change:
+ * - Square viewport with letterboxing. No stretching. The canvas matches the container,
+ *   but simulation content draws inside a centered square viewport.
+ *
+ * Notes on stability:
+ * - Re-initialize simulation buffers whenever core layout changes (N, K, cellSize, etc.).
+ * - Never loop past typed-array lengths; use safe N.
+ * - Do not early-return from re-init when A exists in localStorage.
+ *
+ * Non-reciprocal update:
+ * - Interactions are now non-reciprocal: F_ij and F_ji are computed from A[i][j] and A[j][i] separately.
+ *   This allows self-propelled clusters when A is asymmetric.
  */
 
 // ========================= Spec =========================
@@ -30,10 +43,15 @@ type Spec = {
   wrap: boolean
   cellSize: number
 
-  pixelScale: number
+  pixelScale: number // retained for backwards compatibility; unused in responsive mode
   genMatrix: boolean
 
   overlays: { showVel: boolean; showGrid: boolean }
+
+  mutualOnly: boolean
+  settleEnabled: boolean
+  settleK: number // damping coefficient (1/s). Will be clamped for stability.
+  settleR: number // radius under which settling damping applies (> rMin, ≤ R)
 }
 
 const TYPE_COLORS = [
@@ -52,32 +70,39 @@ const TYPE_COLORS = [
   "#708090", // slate gray
   "#7FFF00", // chartreuse
   "#CC79A7", // pink (okabe-ito)
-  "#000000", // black
+  "#ffffff", // white
 ]
 
+// Default spec configured for a 2-type chasing/fleeing lump.
+// Type 0 chases 1; type 1 flees 0; both self-attract.
 const SPEC: Spec = {
   N: 500,
-  K: 8,
+  K: 5,
   seed: 1337,
 
   A: [
     [0.8, 0.6],
-    [0.0, 0.8],
-  ], // replaced in init
-  rMin: 0.1,
-  R: 0.9,
+    [0.6, 0.8],
+  ],
+  rMin: 0.12,
+  R: 0.75,
 
-  dt: 0.05,
-  drag: 5,
-  vMax: 10,
+  dt: 0.03,
+  drag: 1,
+  vMax: 1.5,
 
   wrap: false,
-  cellSize: 0.12,
+  cellSize: 0.1,
 
-  pixelScale: 900,
+  pixelScale: 800,
   genMatrix: true,
 
-  overlays: { showVel: false, showGrid: false },
+  overlays: { showVel: false, showGrid: true },
+
+  mutualOnly: false,
+  settleEnabled: true,
+  settleK: 0.2,
+  settleR: 0.2,
 }
 
 // ========================= RNG =========================
@@ -115,8 +140,10 @@ function torusDelta(a: number, b: number) {
 // ========================= Particle Life accelerator =========================
 function accelMag(a: number, r: number, rMin: number): number {
   if (r <= 0) return 0
-  if (r < rMin) return r / rMin - 1 // repulsion
+  // hard-core repulsion regardless of 'a'
+  if (r < rMin) return r / rMin - 1
   const denom = Math.max(1e-6, 1 - rMin)
+  // smooth bell between rMin..1
   return a * (1 - Math.abs(1 + rMin - 2 * r) / denom)
 }
 
@@ -196,7 +223,7 @@ function initSim(spec: Spec, seedOverride?: number): Sim {
   const rng = mulberry32(seedOverride ?? spec.seed)
   const K = spec.K
 
-  // choose matrix: localStorage → preset (ring) → random
+  // choose matrix: localStorage → preset (ring) → spec.A
   let A: number[][] | null = loadMatrixFromLS(K)
   if (!A) A = spec.genMatrix ? genRingPreset(K) : spec.A
 
@@ -246,7 +273,8 @@ function cellIndexOf(x: number, y: number, gridDim: number): number {
 }
 function rebuildGrid(sim: Sim) {
   sim.cellHead.fill(-1)
-  const N = sim.spec.N
+  // Safe N prevents writing past typed-array bounds after spec changes.
+  const N = Math.min(sim.spec.N, sim.x.length, sim.next.length)
   const gdim = sim.gridDim
   for (let i = 0; i < N; i++) {
     const idx = cellIndexOf(sim.x[i], sim.y[i], gdim)
@@ -284,37 +312,89 @@ function forEachNeighbor(sim: Sim, i: number, fn: (j: number) => void) {
 }
 
 // ========================= Physics step =========================
+function smoothstep01(t: number) {
+  const x = clamp(t, 0, 1)
+  return x * x * (3 - 2 * x)
+}
+
 function step(sim: Sim) {
   const sp = sim.spec
-  const { N, R, rMin, dt } = { N: sp.N, R: sp.R, rMin: sp.rMin, dt: sp.dt }
+  // Safe N: never iterate beyond buffer lengths.
+  const N = Math.min(sp.N, sim.x.length, sim.vx.length, sim.type.length)
+  const { R, rMin, dt } = { R: sp.R, rMin: sp.rMin, dt: sp.dt }
 
   rebuildGrid(sim)
-  sim.fx.fill(0)
-  sim.fy.fill(0)
+  // Reset only the portion actually used.
+  sim.fx.fill(0, 0, N)
+  sim.fy.fill(0, 0, N)
 
-  // symmetric accumulation
+  // non-reciprocal accumulation
   for (let i = 0; i < N; i++) {
     const ti = sim.type[i] | 0
     forEachNeighbor(sim, i, (j) => {
       if (j <= i) return
+
+      // geometry
       let dx = sp.wrap ? torusDelta(sim.x[i], sim.x[j]) : sim.x[j] - sim.x[i]
       let dy = sp.wrap ? torusDelta(sim.y[i], sim.y[j]) : sim.y[j] - sim.y[i]
       const r2 = dx * dx + dy * dy
       if (r2 === 0) return
       const r = Math.sqrt(r2)
       if (r > R) return
-      const tj = sim.type[j] | 0
-      const aij = sim.A[ti][tj]
-      if (aij === 0) return
-
       const invr = 1 / r
-      const mag = accelMag(aij, r, rMin)
-      const fx = mag * dx * invr
-      const fy = mag * dy * invr
-      sim.fx[i] += fx
-      sim.fy[i] += fy
-      sim.fx[j] -= fx
-      sim.fy[j] -= fy
+      const ux = dx * invr
+      const uy = dy * invr
+
+      // interaction weights (allow non-reciprocity)
+      const tj = (sim.type[j] | 0) as number
+      let aij = sim.A[ti][tj]
+      let aji = sim.A[tj][ti]
+
+      // optional gating: only allow attraction if mutual
+      if (sp.mutualOnly) {
+        const mutualPos = aij > 0 && aji > 0
+        if (!mutualPos) {
+          aij = 0
+          aji = 0
+        }
+      }
+
+      // force on i from j (along +u) and on j from i (along -u)
+      const fij = accelMag(aij, r, rMin)
+      const fji = accelMag(aji, r, rMin)
+
+      if (fij !== 0) {
+        sim.fx[i] += fij * ux
+        sim.fy[i] += fij * uy
+      }
+      if (fji !== 0) {
+        sim.fx[j] -= fji * ux
+        sim.fy[j] -= fji * uy
+      }
+
+      // settling: radial dashpot for mutually attracted neighbors within [rMin, settleR]
+      if (sp.settleEnabled) {
+        const mutualPos = aij > 0 && aji > 0
+        if (mutualPos && r > rMin && r < sp.settleR) {
+          const vRelRad =
+            (sim.vx[i] - sim.vx[j]) * ux + (sim.vy[i] - sim.vy[j]) * uy
+
+          const cCrit = 2 / dt
+          const c = Math.min(Math.max(sp.settleK, 0), cCrit)
+
+          const t = (r - rMin) / Math.max(1e-6, sp.settleR - rMin)
+          const w = 1 - smoothstep01(t) // 1 near rMin, 0 at settleR
+          if (w > 0) {
+            const fDamp = -c * vRelRad * w
+            const fx = fDamp * ux
+            const fy = fDamp * uy
+            sim.fx[i] += fx
+            sim.fy[i] += fy
+            sim.fx[j] -= fx
+            sim.fy[j] -= fy
+          }
+        }
+      }
     })
   }
 
@@ -371,53 +451,90 @@ type Renderer = {
   ctx: CanvasRenderingContext2D
   width: number
   height: number
-  scale: number
   dpr: number
+  // square viewport centered within the canvas
+  viewX: number
+  viewY: number
+  viewSize: number
+  scale: number // viewSize / WORLD_SIZE
 }
-function setupCanvas(canvas: HTMLCanvasElement, pixels: number): Renderer {
+
+/** Canvas matches container; content uses a centered square viewport (no stretch). */
+function setupCanvasViewport(
+  canvas: HTMLCanvasElement,
+  widthPx: number,
+  heightPx: number
+): Renderer {
   const dpr = Math.max(1, (window.devicePixelRatio as number) || 1)
-  const size = pixels
-  canvas.style.width = `${size}px`
-  canvas.style.height = `${size}px`
-  canvas.width = Math.floor(size * dpr)
-  canvas.height = Math.floor(size * dpr)
+
+  canvas.style.width = `${widthPx}px`
+  canvas.style.height = `${heightPx}px`
+  canvas.width = Math.floor(widthPx * dpr)
+  canvas.height = Math.floor(heightPx * dpr)
+
   const ctx = canvas.getContext("2d")!
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  const scale = size / WORLD_SIZE
-  return { ctx, width: size, height: size, scale, dpr }
+
+  const viewSize = Math.min(widthPx, heightPx)
+  const viewX = Math.floor((widthPx - viewSize) / 2)
+  const viewY = Math.floor((heightPx - viewSize) / 2)
+  const scale = viewSize / WORLD_SIZE
+
+  return {
+    ctx,
+    width: widthPx,
+    height: heightPx,
+    dpr,
+    viewX,
+    viewY,
+    viewSize,
+    scale,
+  }
 }
+
 function worldToScreen(x: number, y: number, r: Renderer) {
-  const sx = (x + 1) * 0.5 * r.width
-  const sy = (y + 1) * 0.5 * r.height
+  const sx = r.viewX + (x + 1) * 0.5 * r.viewSize
+  const sy = r.viewY + (y + 1) * 0.5 * r.viewSize
   return [sx, sy] as const
 }
+
 function draw(sim: Sim, r: Renderer) {
-  const { ctx, width, height } = r
+  const { ctx, width, height, viewX, viewY, viewSize } = r
   const { showVel, showGrid } = sim.spec.overlays
 
+  // clear whole canvas
   ctx.fillStyle = "#0a0a0a"
   ctx.fillRect(0, 0, width, height)
 
+  // optional grid inside square viewport
   if (showGrid) {
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(viewX, viewY, viewSize, viewSize)
+    ctx.clip()
+
     ctx.strokeStyle = "rgba(255,255,255,0.06)"
     ctx.lineWidth = 1
-    const step = (sim.spec.cellSize * r.width) / WORLD_SIZE
-    for (let x = 0; x <= width; x += step) {
+    const step = (sim.spec.cellSize * viewSize) / WORLD_SIZE
+
+    for (let x = viewX; x <= viewX + viewSize + 0.5; x += step) {
       ctx.beginPath()
-      ctx.moveTo(x, 0)
-      ctx.lineTo(x, height)
+      ctx.moveTo(x, viewY)
+      ctx.lineTo(x, viewY + viewSize)
       ctx.stroke()
     }
-    for (let y = 0; y <= height; y += step) {
+    for (let y = viewY; y <= viewY + viewSize + 0.5; y += step) {
       ctx.beginPath()
-      ctx.moveTo(0, y)
-      ctx.lineTo(width, y)
+      ctx.moveTo(viewX, y)
+      ctx.lineTo(viewX + viewSize, y)
       ctx.stroke()
     }
+    ctx.restore()
   }
 
+  // particles
   const radiusPx = 2
-  const N = sim.spec.N
+  const N = Math.min(sim.spec.N, sim.x.length)
   for (let i = 0; i < N; i++) {
     const t = sim.type[i] | 0
     const [px, py] = worldToScreen(sim.x[i], sim.y[i], r)
@@ -438,6 +555,7 @@ function draw(sim: Sim, r: Renderer) {
     }
   }
 
+  // HUD text inside viewport
   ctx.fillStyle = "#FFFFFF"
   ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
   const A0 = sim.A[0]
@@ -452,13 +570,20 @@ function draw(sim: Sim, r: Renderer) {
     `rMin=${sim.spec.rMin.toFixed(2)}  R=${sim.spec.R.toFixed(
       2
     )}  cell=${sim.spec.cellSize.toFixed(2)}`,
+    `mutual=${sim.spec.mutualOnly ? 1 : 0}  settle=${
+      sim.spec.settleEnabled ? 1 : 0
+    }  k=${sim.spec.settleK.toFixed(2)}  sR=${sim.spec.settleR.toFixed(2)}`,
     `A[0,*]=[${A0 ?? ""}]`,
   ]
-  let y = 16
+  let ty = viewY + 16
   for (const ln of lines) {
-    ctx.fillText(ln, 8, y)
-    y += 14
+    ctx.fillText(ln, viewX + 8, ty)
+    ty += 14
   }
+
+  // viewport border (optional)
+  ctx.strokeStyle = "rgba(255,255,255,0.08)"
+  ctx.strokeRect(viewX + 0.5, viewY + 0.5, viewSize - 1, viewSize - 1)
 }
 
 // ========================= Matrix Toolbar =========================
@@ -471,15 +596,25 @@ type MatrixToolbarProps = {
 }
 
 function valueToSwatch(v: number): string {
-  // map -1..1 to color: repulsion blue→neutral dark→attraction green/yellow
+  // map -1..1 to blue → black → red
   const t = (v + 1) / 2 // 0..1
-  const h = 220 * (1 - t) + 80 * t // 220 (blue) to 80 (yellow-green)
-  const s = 70
-  const l = 35 + 25 * Math.abs(v)
-  return `hsl(${h.toFixed(0)} ${s}% ${l}%)`
+  let r, g, b
+  if (t < 0.5) {
+    const f = t / 0.5
+    r = 0
+    g = 0
+    b = Math.round(255 * (1 - f))
+  } else {
+    const f = (t - 0.5) / 0.5
+    r = Math.round(255 * f)
+    g = 0
+    b = 0
+  }
+  return `rgb(${r}, ${g}, ${b})`
 }
+
 function cycleValue(v: number, dir: number) {
-  const steps = [-1, -0.5, 0, 0.5, 1]
+  const steps = [-1, 0, 1]
   const idx = steps.findIndex((x) => Math.abs(x - v) < 1e-6)
   if (idx < 0) return 0
   const ni = (idx + dir + steps.length) % steps.length
@@ -564,13 +699,10 @@ function MatrixToolbar({
         </button>
       </div>
 
-      {/* legend */}
       <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 8 }}>
-        Left-click: cycle up. Right-click: cycle down. Values: −1, −0.5, 0,
-        +0.5, +1.
+        Left-click: cycle up. Right-click: cycle down. Values: −1, 0, +1.
       </div>
 
-      {/* header row of colors */}
       <div
         style={{
           display: "grid",
@@ -594,7 +726,6 @@ function MatrixToolbar({
           />
         ))}
 
-        {/* matrix rows */}
         {Array.from({ length: K }, (_, i) => (
           <React.Fragment key={`row${i}`}>
             <div
@@ -613,7 +744,14 @@ function MatrixToolbar({
                   onClick={(e) => handleClick(i, j, e)}
                   onContextMenu={(e) => handleClick(i, j, e)}
                   title={`A[${i}][${j}] = ${A[i][j].toFixed(2)}`}
-                  style={{ ...cellBtn, background: valueToSwatch(A[i][j]) }}
+                  style={{
+                    ...cellBtn,
+                    background:
+                      Math.abs(A[i][j]) > 1e-6
+                        ? valueToSwatch(A[i][j])
+                        : "transparent",
+                    border: "1px solid #ffffff",
+                  }}
                 />
               </div>
             ))}
@@ -641,63 +779,78 @@ function useAnimationFrame(callback: (t: number) => void, paused: boolean) {
     }
   }, [callback, paused])
 }
-function useRenderer(pixels: number) {
+
+/** Responsive renderer tied to container via ResizeObserver; no stretch (square viewport). */
+function useRendererViewport() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Renderer | null>(null)
+
   useEffect(() => {
-    function setup() {
+    const refresh = () => {
       const canvas = canvasRef.current
-      if (!canvas) return
-      rendererRef.current = setupCanvas(canvas, pixels)
+      const container = containerRef.current
+      if (!canvas || !container) return
+      const rect = container.getBoundingClientRect()
+      rendererRef.current = setupCanvasViewport(canvas, rect.width, rect.height)
     }
-    setup()
-    const onResize = () => setup()
-    window.addEventListener("resize", onResize)
-    return () => window.removeEventListener("resize", onResize)
-  }, [pixels])
-  return { canvasRef, rendererRef }
+
+    const ro = new ResizeObserver(() => refresh())
+    if (containerRef.current) ro.observe(containerRef.current)
+    // initial sizing
+    refresh()
+    return () => ro.disconnect()
+  }, [])
+
+  return { canvasRef, containerRef, rendererRef }
 }
 
 // ========================= Component =========================
 export default function App() {
-  const [spec, setSpec] = useState<Spec>({ ...SPEC, A: genRingPreset(SPEC.K) })
+  // Use SPEC directly; do not override A on first render.
+  const [spec, setSpec] = useState<Spec>({ ...SPEC })
   const [seed, setSeed] = useState<number>(SPEC.seed)
   const [paused, setPaused] = useState(false)
   const [showRules, setShowRules] = useState(true)
   const [fps, setFps] = useState(0)
 
   const simRef = useRef<Sim | null>(null)
-  const { canvasRef, rendererRef } = useRenderer(spec.pixelScale)
+  const { canvasRef, containerRef, rendererRef } = useRendererViewport()
 
-  // init / re-init when core spec changes (except A)
+  // -------- Resolve matrix exactly once per K or when genMatrix flag is true.
   useEffect(() => {
-    // if K changed, ensure A has correct shape: prefer LS → ring
+    if (!spec.genMatrix) return
     const fromLS = loadMatrixFromLS(spec.K)
-    if (fromLS) {
-      setSpec((s) => ({ ...s, A: fromLS, genMatrix: false }))
-      // sim will be created in next effect run
-      return
-    }
-    if (
-      !spec.A ||
-      spec.A.length !== spec.K ||
-      spec.A.some((r) => r.length !== spec.K)
-    ) {
-      setSpec((s) => ({ ...s, A: genRingPreset(spec.K), genMatrix: false }))
-      return
-    }
+    const nextA =
+      fromLS ??
+      (spec.A &&
+      spec.A.length === spec.K &&
+      spec.A.every((r) => Array.isArray(r) && r.length === spec.K)
+        ? spec.A
+        : genRingPreset(spec.K))
+    setSpec((s) => ({ ...s, A: nextA, genMatrix: false }))
+  }, [spec.K, spec.genMatrix])
+
+  // -------- Initialize / Re-initialize simulation when core layout changes.
+  useEffect(() => {
     simRef.current = initSim(spec, seed)
   }, [
+    seed,
+    spec.N,
     spec.K,
-    spec.seed,
     spec.cellSize,
     spec.wrap,
-    spec.N,
+    spec.R,
+    spec.rMin,
     spec.dt,
     spec.drag,
     spec.vMax,
-    seed,
-  ]) // core fields
+  ])
+
+  // keep runtime sim reading latest spec without forcing reset
+  useEffect(() => {
+    if (simRef.current) simRef.current.spec = spec
+  }, [spec])
 
   // draw loop
   useAnimationFrame(() => {
@@ -736,7 +889,6 @@ export default function App() {
   function applyMatrix(A: number[][]) {
     setSpec((s) => ({ ...s, A, genMatrix: false }))
     if (simRef.current && simRef.current.K === A.length) {
-      // shallow clone so React state stays immutable, but sim uses same content
       simRef.current.A = A.map((row) => row.slice())
     }
   }
@@ -748,16 +900,19 @@ export default function App() {
   }
   const handleRandomizeSeed = () => setSeed(Math.floor(Math.random() * 1e9))
   const incN = (delta: number) => {
-    const newN = clamp(spec.N + delta, 100, 50000)
-    setSpec({ ...spec, N: newN })
+    const newN = clamp(spec.N + delta, 0, 50000) // allow 0 safely
+    setSpec((s) => ({ ...s, N: newN }))
   }
   const incK = (delta: number) => {
     const maxK = TYPE_COLORS.length
     const newK = clamp(spec.K + delta, 2, maxK)
-    setSpec((s) => ({ ...s, K: newK }))
+    setSpec((s) => ({ ...s, K: newK })) // force A regeneration on K change
   }
   const applyRingPreset = () =>
     applyMatrix(genRingPreset(spec.K, 0.9, 0.6, 0.0))
+
+  const inc = (v: number, d: number, lo: number, hi: number) =>
+    clamp(v + d, lo, hi)
 
   return (
     <div
@@ -807,12 +962,12 @@ export default function App() {
 
           <div style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
             <span style={{ opacity: 0.7 }}>N:</span>
-            <button onClick={() => incN(-500)} style={chipStyle}>
-              −500
+            <button onClick={() => incN(-100)} style={chipStyle}>
+              −100
             </button>
             <span>{spec.N}</span>
-            <button onClick={() => incN(+500)} style={chipStyle}>
-              +500
+            <button onClick={() => incN(+100)} style={chipStyle}>
+              +100
             </button>
           </div>
 
@@ -838,6 +993,7 @@ export default function App() {
           >
             <label
               style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+              title="Draw velocity vectors"
             >
               <input
                 type="checkbox"
@@ -853,6 +1009,7 @@ export default function App() {
             </label>
             <label
               style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+              title="Show spatial grid"
             >
               <input
                 type="checkbox"
@@ -868,6 +1025,7 @@ export default function App() {
             </label>
             <label
               style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+              title="World wraps on edges"
             >
               <input
                 type="checkbox"
@@ -876,6 +1034,101 @@ export default function App() {
               />
               Wrap
             </label>
+          </div>
+
+          {/* Behavior toggles */}
+          <div
+            style={{
+              display: "inline-flex",
+              gap: 10,
+              alignItems: "center",
+              marginLeft: 12,
+            }}
+          >
+            <label
+              style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+              title="Only allow attraction when A[i][j] and A[j][i] are both > 0"
+            >
+              <input
+                type="checkbox"
+                checked={spec.mutualOnly}
+                onChange={(e) =>
+                  setSpec({ ...spec, mutualOnly: e.target.checked })
+                }
+              />
+              Mutual
+            </label>
+            <label
+              style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+              title="Enable settling (radial damping for mutually attracted pairs)"
+            >
+              <input
+                type="checkbox"
+                checked={spec.settleEnabled}
+                onChange={(e) =>
+                  setSpec({ ...spec, settleEnabled: e.target.checked })
+                }
+              />
+              Settle
+            </label>
+
+            <div
+              style={{ display: "inline-flex", gap: 6, alignItems: "center" }}
+            >
+              <span style={{ opacity: 0.7 }}>k:</span>
+              <button
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    settleK: inc(s.settleK, -0.01, 0, 20),
+                  }))
+                }
+                style={chipStyle}
+              >
+                −
+              </button>
+              <span>{spec.settleK.toFixed(2)}</span>
+              <button
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    settleK: inc(s.settleK, +0.01, 0, 20),
+                  }))
+                }
+                style={chipStyle}
+              >
+                +
+              </button>
+            </div>
+
+            <div
+              style={{ display: "inline-flex", gap: 6, alignItems: "center" }}
+            >
+              <span style={{ opacity: 0.7 }}>sR:</span>
+              <button
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    settleR: inc(s.settleR, -0.01, 0.05, 1),
+                  }))
+                }
+                style={chipStyle}
+              >
+                −
+              </button>
+              <span>{spec.settleR.toFixed(2)}</span>
+              <button
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    settleR: inc(s.settleR, +0.01, 0.05, 1),
+                  }))
+                }
+                style={chipStyle}
+              >
+                +
+              </button>
+            </div>
           </div>
 
           <button
@@ -888,11 +1141,25 @@ export default function App() {
         </div>
       </div>
 
-      {/* Canvas */}
-      <div style={{ display: "grid", placeItems: "center", padding: 8 }}>
+      {/* Canvas area (middle row) */}
+      <div
+        ref={containerRef}
+        style={{
+          position: "relative",
+          width: "100%",
+          height: "100%",
+          minHeight: 0,
+          overflow: "hidden",
+        }}
+      >
         <canvas
           ref={canvasRef}
-          style={{ borderRadius: 8, background: "#0a0a0a" }}
+          style={{
+            width: "100%",
+            height: "100%",
+            display: "block",
+            background: "#0a0a0a",
+          }}
         />
       </div>
 
@@ -934,6 +1201,7 @@ const buttonStyle: React.CSSProperties = {
   borderRadius: 6,
   cursor: "pointer",
 }
+
 const chipStyle: React.CSSProperties = {
   background: "#111827",
   color: "#e5e7eb",
